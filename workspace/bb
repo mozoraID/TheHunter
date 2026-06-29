@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Bug-bounty wrapper for PentestGPT.
+# Always runs pentest mode + telemetry off, and saves a timestamped log to /workspace.
+# Usage:
+#   /workspace/bb --target https://app.cetus.zone --instruction "scope notes..."
+#   /workspace/bb --target 10.0.0.5
+ts=$(date +%F_%H%M%S)
+log="/workspace/scan-${ts}.log"
+echo "[bb] mode=pentest  log=${log}"
+pentestgpt --mode pentest --no-telemetry "$@" 2>&1 | tee "$log"
+echo "[bb] saved: ${log}"

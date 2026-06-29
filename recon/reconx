@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# =============================================================================
+# reconx — PentestGPT's unified recon & attack-surface engine
+#
+# One engine that distills the methodology of three frameworks into a single,
+# token-budget-friendly pipeline that PentestGPT's GLM agent (and you) can call:
+#
+#   * reconFTW  (six2dez)  -> breadth: subdomains -> resolve -> web -> vulns
+#   * Sn1per    (1N3)      -> scan MODES (flyover / recon / full / vuln)
+#   * Osmedeus  (j3ssie)   -> structured workflow + JSON/markdown artifacts
+#
+# Design goals:
+#   - Graceful degradation: prefer modern tools (subfinder/httpx/nuclei/naabu/
+#     dnsx/ffuf) but fall back to crt.sh/curl/nmap/dig so it ALWAYS runs.
+#   - Budget-aware: full results go to files; stdout stays a concise summary so
+#     the LLM doesn't drown (and burn neurons) in raw output.
+#   - Authorized use only. You are responsible for scope.
+#
+# Usage:
+#   reconx --target <domain|ip|url> [--mode flyover|recon|full|vuln]
+#          [--out DIR] [--threads N] [--top-ports N] [--quiet] [--no-vulns]
+#
+# Exit codes: 0 ok, 2 usage error, 3 no target reachable.
+# =============================================================================
+set -uo pipefail
+
+VERSION="1.0.0"
+SELF="$(basename "$0")"
+
+# ---- defaults -------------------------------------------------------------
+MODE="recon"
+THREADS=40
+TOP_PORTS=200
+QUIET=0
+RUN_VULNS="auto"     # auto = on for full/vuln modes
+OUT_BASE="${RECONX_OUT:-$PWD}"
+TARGET=""
+
+# ---- pretty logging (to stderr so stdout stays parseable) -----------------
+c_reset=""; c_dim=""; c_grn=""; c_yel=""; c_red=""; c_cyn=""
+if [ -t 2 ]; then
+  c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_grn=$'\033[0;32m'
+  c_yel=$'\033[0;33m'; c_red=$'\033[0;31m'; c_cyn=$'\033[0;36m'
+fi
+log()  { [ "$QUIET" = 1 ] || printf '%s[reconx]%s %s\n' "$c_cyn" "$c_reset" "$*" >&2; }
+ok()   { [ "$QUIET" = 1 ] || printf '%s[reconx]%s %s%s%s\n' "$c_cyn" "$c_reset" "$c_grn" "$*" "$c_reset" >&2; }
+warn() { printf '%s[reconx]%s %s%s%s\n' "$c_cyn" "$c_reset" "$c_yel" "$*" "$c_reset" >&2; }
+err()  { printf '%s[reconx]%s %s%s%s\n' "$c_cyn" "$c_reset" "$c_red" "$*" "$c_reset" >&2; }
+
+# have(): true if a tool is usable. RECONX_DISABLE="httpx subfinder ..." forces
+# specific tools to be treated as absent (useful for testing fallbacks or when a
+# name is shadowed by an unrelated binary, e.g. the Python httpx CLI).
+RECONX_DISABLE="${RECONX_DISABLE:-}"
+have() {
+  case " $RECONX_DISABLE " in *" $1 "*) return 1 ;; esac
+  command -v "$1" >/dev/null 2>&1
+}
+
+usage() {
+  cat >&2 <<EOF
+$SELF v$VERSION — unified recon engine (reconFTW + Sn1per + Osmedeus, harmonized)
+
+Usage:
+  $SELF --target <domain|ip|url> [options]
+
+Modes (--mode):
+  flyover   Fast surface sweep: subdomains + live web probe + tech (no port/vuln)
+  recon     (default) subdomains + DNS + ports + web + content discovery
+  full      recon + vulnerability scan (nuclei / nmap vuln scripts)
+  vuln      Vulnerability scan only (assumes target host(s) already known)
+
+Options:
+  --out DIR        Output base directory (default: \$PWD)
+  --threads N      Concurrency for tools that support it (default: $THREADS)
+  --top-ports N    Top N TCP ports to scan (default: $TOP_PORTS)
+  --no-vulns       Force-disable the vuln phase even in full mode
+  --quiet          Suppress progress logging (stdout summary still printed)
+  -h, --help       This help
+
+Artifacts are written to: <out>/recon-<target>-<timestamp>/
+EOF
+}
+
+# ---- arg parsing ----------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--target)   TARGET="${2:-}"; shift 2 ;;
+    -m|--mode)     MODE="${2:-}"; shift 2 ;;
+    --out)         OUT_BASE="${2:-}"; shift 2 ;;
+    --threads)     THREADS="${2:-}"; shift 2 ;;
+    --top-ports)   TOP_PORTS="${2:-}"; shift 2 ;;
+    --no-vulns)    RUN_VULNS="off"; shift ;;
+    -q|--quiet)    QUIET=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *) err "Unknown argument: $1"; usage; exit 2 ;;
+  esac
+done
+
+case "$MODE" in flyover|recon|full|vuln) ;; *) err "Invalid mode: $MODE"; usage; exit 2 ;; esac
+[ -n "$TARGET" ] || { err "Missing --target"; usage; exit 2; }
+
+# ---- target normalization -------------------------------------------------
+# Strip scheme + path -> bare host. Detect IP vs domain. Keep original for web.
+RAW_TARGET="$TARGET"
+HOST="$(printf '%s' "$TARGET" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s#:.*$##')"
+IS_IP=0
+if printf '%s' "$HOST" | grep -Eq '^[0-9]+(\.[0-9]+){3}$'; then IS_IP=1; fi
+
+SAFE="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9.-' '_')"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT="${OUT_BASE%/}/recon-${SAFE}-${TS}"
+mkdir -p "$OUT" || { err "Cannot create output dir: $OUT"; exit 2; }
+
+SUBS="$OUT/subdomains.txt"
+HOSTS="$OUT/hosts.txt"          # resolvable hosts
+PORTS="$OUT/ports.txt"
+WEB="$OUT/web.txt"              # live http(s) endpoints
+TECH="$OUT/tech.txt"
+CONTENT="$OUT/content.txt"
+VULNS="$OUT/vulns.txt"
+WAF="$OUT/waf.txt"             # WAF/CDN detection      (reconFTW waf_checks / Sn1per wafw00f)
+TAKEOVER="$OUT/takeover.txt"   # subdomain takeover     (reconFTW subtakeover)
+URLS="$OUT/urls.txt"           # historical/crawled URLs (reconFTW urlchecks)
+SECRETS="$OUT/secrets.txt"     # JS endpoints/secrets   (reconFTW jschecks)
+SCREENS="$OUT/screenshots"     # screenshots dir        (Sn1per/Osmedeus/reconFTW)
+SUMMARY="$OUT/summary.md"
+RESULT="$OUT/result.json"
+: > "$SUBS"; : > "$HOSTS"; : > "$PORTS"; : > "$WEB"; : > "$TECH"; : > "$CONTENT"; : > "$VULNS"
+: > "$WAF"; : > "$TAKEOVER"; : > "$URLS"; : > "$SECRETS"
+
+log "target=$HOST  mode=$MODE  is_ip=$IS_IP  out=$OUT"
+
+# Track which engine satisfied each phase (Osmedeus-style provenance).
+declare -A ENGINE=()
+
+# =============================================================================
+# Phase 1 — Subdomain enumeration (skipped for raw IPs)
+# =============================================================================
+phase_subs() {
+  if [ "$IS_IP" = 1 ]; then echo "$HOST" >> "$SUBS"; ENGINE[subs]="n/a(ip)"; return; fi
+  log "subdomains: enumerating $HOST"
+  local found=0
+  if have subfinder; then
+    subfinder -silent -d "$HOST" -t "$THREADS" 2>/dev/null >> "$SUBS" && ENGINE[subs]="subfinder"; found=1
+  fi
+  if have assetfinder; then
+    assetfinder --subs-only "$HOST" 2>/dev/null >> "$SUBS"; ENGINE[subs]="${ENGINE[subs]:-assetfinder}"; found=1
+  fi
+  if [ "$found" = 0 ] && have curl; then
+    # Fallback: certificate transparency via crt.sh
+    if have jq; then
+      curl -s --max-time 30 "https://crt.sh/?q=%25.${HOST}&output=json" 2>/dev/null \
+        | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' >> "$SUBS"
+    else
+      curl -s --max-time 30 "https://crt.sh/?q=%25.${HOST}&output=json" 2>/dev/null \
+        | grep -oE '[a-zA-Z0-9._-]+\.'"${HOST//./\\.}" >> "$SUBS"
+    fi
+    ENGINE[subs]="crt.sh"
+  fi
+  # Active brute-force of common names (reconFTW sub_brute) — full mode only.
+  if [ "$MODE" = full ]; then
+    local common="www mail ftp webmail smtp pop ns1 ns2 admin api dev staging test \
+      portal vpn m blog shop secure server git gitlab jenkins jira cdn img static \
+      assets dashboard internal intranet beta app apps auth login proxy db sql mysql"
+    local brutefile="$OUT/.brute"; : > "$brutefile"
+    for p in $common; do echo "$p.$HOST"; done > "$brutefile"
+    if have dnsx; then
+      dnsx -silent < "$brutefile" 2>/dev/null >> "$SUBS"
+    else
+      while IFS= read -r bh; do
+        if { have dig && dig +short "$bh" 2>/dev/null | grep -qE '^[0-9]'; } \
+           || host "$bh" 2>/dev/null | grep -qi 'has address'; then echo "$bh" >> "$SUBS"; fi
+      done < "$brutefile"
+    fi
+    ENGINE[subs]="${ENGINE[subs]:-passive}+brute"
+  fi
+  echo "$HOST" >> "$SUBS"
+  sort -u "$SUBS" -o "$SUBS"
+  ok "subdomains: $(wc -l < "$SUBS" | tr -d ' ') unique (engine: ${ENGINE[subs]:-none})"
+}
+
+# =============================================================================
+# Phase 2 — DNS resolution (which subdomains are live)
+# =============================================================================
+phase_dns() {
+  if [ "$IS_IP" = 1 ]; then echo "$HOST" >> "$HOSTS"; ENGINE[dns]="n/a(ip)"; return; fi
+  log "dns: resolving $(wc -l < "$SUBS" | tr -d ' ') hosts"
+  if have dnsx; then
+    dnsx -silent -t "$THREADS" < "$SUBS" 2>/dev/null >> "$HOSTS" && ENGINE[dns]="dnsx"
+  else
+    local resolver="host"; have dig && resolver="dig"
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      if [ "$resolver" = dig ]; then
+        dig +short "$h" 2>/dev/null | grep -qE '^[0-9]' && echo "$h" >> "$HOSTS"
+      else
+        host "$h" 2>/dev/null | grep -qi 'has address' && echo "$h" >> "$HOSTS"
+      fi
+    done < "$SUBS"
+    ENGINE[dns]="$resolver"
+  fi
+  sort -u "$HOSTS" -o "$HOSTS"
+  [ -s "$HOSTS" ] || cp "$SUBS" "$HOSTS"
+  ok "dns: $(wc -l < "$HOSTS" | tr -d ' ') live host(s) (engine: ${ENGINE[dns]:-none})"
+}
+
+# =============================================================================
+# Phase 3 — Port scan
+# =============================================================================
+phase_ports() {
+  log "ports: scanning top $TOP_PORTS (this can take a moment)"
+  if have naabu; then
+    naabu -silent -top-ports "$TOP_PORTS" -c "$THREADS" < "$HOSTS" 2>/dev/null >> "$PORTS" \
+      && ENGINE[ports]="naabu"
+  elif have nmap; then
+    # nmap fallback: greppable scan, then emit host:port for each open port.
+    nmap -T4 --top-ports "$TOP_PORTS" --open -iL "$HOSTS" -oG "$OUT/nmap.gnmap" >/dev/null 2>&1
+    # Each "Host:" line in gnmap carries that host's open ports on the same line.
+    awk '/Ports:/{
+      host=$2;
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /\/open\//) { split($i, p, "/"); print host ":" p[1] }
+      }
+    }' "$OUT/nmap.gnmap" 2>/dev/null | tr -d ',' >> "$PORTS" || true
+    ENGINE[ports]="nmap"
+  else
+    warn "ports: no naabu/nmap available — skipping"
+    ENGINE[ports]="none"
+  fi
+  sort -u "$PORTS" -o "$PORTS"
+  ok "ports: $(wc -l < "$PORTS" | tr -d ' ') open host:port (engine: ${ENGINE[ports]:-none})"
+}
+
+# =============================================================================
+# Phase 4 — Web probing + tech fingerprint
+# =============================================================================
+phase_web() {
+  log "web: probing for live HTTP(S) services"
+  if have httpx; then
+    httpx -silent -t "$THREADS" -title -tech-detect -status-code -no-color < "$HOSTS" 2>/dev/null \
+      | tee "$TECH" | awk '{print $1}' >> "$WEB"
+    ENGINE[web]="httpx"
+  else
+    # Fallback: curl http+https on common ports
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      for url in "https://$h" "http://$h"; do
+        code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' -L "$url" 2>/dev/null)"
+        if [ -n "$code" ] && [ "$code" != "000" ]; then
+          echo "$url" >> "$WEB"
+          echo "$url [$code]" >> "$TECH"
+        fi
+      done
+    done < "$HOSTS"
+    local web_engine="curl"
+    if have whatweb; then
+      while IFS= read -r u; do whatweb --colour=never -q "$u" 2>/dev/null >> "$TECH"; done < "$WEB"
+      web_engine="curl+whatweb"
+    fi
+    ENGINE[web]="$web_engine"
+  fi
+  sort -u "$WEB" -o "$WEB"
+  ok "web: $(wc -l < "$WEB" | tr -d ' ') live endpoint(s) (engine: ${ENGINE[web]:-none})"
+}
+
+# =============================================================================
+# Phase 5 — Content discovery (light; respects budget)
+# =============================================================================
+phase_content() {
+  [ -s "$WEB" ] || { warn "content: no web endpoints — skipping"; return; }
+  log "content: discovering paths on $(wc -l < "$WEB" | tr -d ' ') endpoint(s)"
+  local wl=""
+  for cand in /usr/share/seclists/Discovery/Web-Content/common.txt \
+              /usr/share/wordlists/dirb/common.txt \
+              /usr/share/dirb/wordlists/common.txt \
+              /usr/share/wordlists/dirbuster/directory-list-2.3-small.txt; do
+    [ -f "$cand" ] && { wl="$cand"; break; }
+  done
+  local target_url; target_url="$(head -n1 "$WEB")"
+  if have ffuf && [ -n "$wl" ]; then
+    ffuf -s -t "$THREADS" -w "$wl" -u "${target_url%/}/FUZZ" -mc 200,204,301,302,307,401,403 2>/dev/null \
+      | sed "s#^#${target_url%/}/#" >> "$CONTENT"
+    ENGINE[content]="ffuf"
+  elif have gobuster && [ -n "$wl" ]; then
+    gobuster dir -q -t "$THREADS" -w "$wl" -u "$target_url" 2>/dev/null | awk '{print $1}' >> "$CONTENT"
+    ENGINE[content]="gobuster"
+  else
+    # Fallback: probe a tiny built-in high-signal path list with curl
+    for p in robots.txt sitemap.xml .git/HEAD .env config.php admin login \
+             api .well-known/security.txt backup.zip wp-login.php; do
+      code="$(curl -s -o /dev/null -m 6 -w '%{http_code}' "${target_url%/}/$p" 2>/dev/null)"
+      case "$code" in 200|301|302|401|403) echo "${target_url%/}/$p [$code]" >> "$CONTENT" ;; esac
+    done
+    ENGINE[content]="curl-builtin"
+  fi
+  sort -u "$CONTENT" -o "$CONTENT"
+  ok "content: $(wc -l < "$CONTENT" | tr -d ' ') path(s) (engine: ${ENGINE[content]:-none})"
+}
+
+# =============================================================================
+# Phase 6 — Vulnerability scan
+# =============================================================================
+phase_vulns() {
+  log "vulns: scanning (this is the slow phase)"
+  if have nuclei && [ -s "$WEB" ]; then
+    nuclei -silent -nc -severity low,medium,high,critical -rl 150 -c "$THREADS" \
+      -l "$WEB" 2>/dev/null >> "$VULNS"
+    ENGINE[vulns]="nuclei"
+  elif have nmap; then
+    nmap -T4 --top-ports "$TOP_PORTS" --script "vuln" -iL "$HOSTS" -oN "$OUT/nmap_vuln.txt" >/dev/null 2>&1
+    grep -E 'VULNERABLE|CVE-' "$OUT/nmap_vuln.txt" 2>/dev/null >> "$VULNS" || true
+    ENGINE[vulns]="nmap-vuln"
+  else
+    warn "vulns: no nuclei/nmap available — skipping"
+    ENGINE[vulns]="none"
+  fi
+  sort -u "$VULNS" -o "$VULNS"
+  ok "vulns: $(wc -l < "$VULNS" | tr -d ' ') finding(s) (engine: ${ENGINE[vulns]:-none})"
+}
+
+# =============================================================================
+# Phase 7 — WAF / CDN detection (reconFTW waf_checks / Sn1per wafw00f)
+# =============================================================================
+phase_waf() {
+  [ -s "$WEB" ] || return
+  log "waf: detecting WAF/CDN"
+  if have wafw00f; then
+    wafw00f -i "$WEB" 2>/dev/null | grep -iE 'is behind|seems to be behind|No WAF' >> "$WAF"
+    ENGINE[waf]="wafw00f"
+  else
+    while IFS= read -r u; do
+      sig="$(curl -sI -m 8 "$u" 2>/dev/null \
+        | grep -ioE 'cloudflare|akamai|sucuri|incapsula|imperva|aws|barracuda|big-?ip|fastly|cloudfront' | head -1)"
+      [ -n "$sig" ] && echo "$u -> $sig" >> "$WAF"
+    done < "$WEB"
+    ENGINE[waf]="curl-headers"
+  fi
+  sort -u "$WAF" -o "$WAF"
+  ok "waf: $(wc -l < "$WAF" | tr -d ' ') signal(s) (engine: ${ENGINE[waf]:-none})"
+}
+
+# =============================================================================
+# Phase 8 — Subdomain takeover (reconFTW subtakeover)
+# =============================================================================
+phase_takeover() {
+  [ "$IS_IP" = 1 ] && return
+  [ -s "$HOSTS" ] || return
+  log "takeover: checking for dangling CNAMEs"
+  if have nuclei; then
+    nuclei -silent -nc -tags takeover -l "$HOSTS" 2>/dev/null >> "$TAKEOVER"
+    ENGINE[takeover]="nuclei"
+  elif have subjack; then
+    subjack -w "$HOSTS" -ssl -t "$THREADS" -timeout 15 2>/dev/null | grep -iv 'Not Vulnerable' >> "$TAKEOVER"
+    ENGINE[takeover]="subjack"
+  else
+    local provs='s3.amazonaws.com|github.io|herokuapp.com|azurewebsites.net|cloudapp.net|wpengine.com|fastly|pantheon|ghost.io|surge.sh|bitbucket.io|zendesk.com|readme.io|netlify|shopify'
+    while IFS= read -r h; do
+      cn="$( { have dig && dig +short CNAME "$h" 2>/dev/null; } || host -t CNAME "$h" 2>/dev/null | awk '{print $NF}')"
+      [ -n "$cn" ] && printf '%s' "$cn" | grep -qiE "$provs" && echo "$h -> $cn (potential takeover)" >> "$TAKEOVER"
+    done < "$HOSTS"
+    ENGINE[takeover]="dns-cname"
+  fi
+  sort -u "$TAKEOVER" -o "$TAKEOVER"
+  ok "takeover: $(wc -l < "$TAKEOVER" | tr -d ' ') candidate(s) (engine: ${ENGINE[takeover]:-none})"
+}
+
+# =============================================================================
+# Phase 9 — Historical / crawled URLs (reconFTW urlchecks)
+# =============================================================================
+phase_urls() {
+  [ -s "$WEB" ] || return
+  log "urls: gathering historical + crawled URLs"
+  local engine=""
+  if have gau; then
+    sed -E 's#^https?://##' "$WEB" | sort -u | gau --threads "$THREADS" 2>/dev/null >> "$URLS"; engine="gau"
+  fi
+  if have waybackurls; then
+    sed -E 's#^https?://##' "$WEB" | sort -u | waybackurls 2>/dev/null >> "$URLS"
+    engine="${engine:+$engine+}waybackurls"
+  fi
+  if have katana; then
+    katana -silent -d 2 -jc -list "$WEB" 2>/dev/null >> "$URLS"; engine="${engine:+$engine+}katana"
+  fi
+  if [ -z "$engine" ]; then
+    curl -s -m 30 "https://web.archive.org/cdx/search/cdx?url=${HOST}/*&output=text&fl=original&collapse=urlkey&limit=500" 2>/dev/null >> "$URLS"
+    engine="wayback-cdx"
+  fi
+  ENGINE[urls]="$engine"
+  sort -u "$URLS" -o "$URLS"
+  ok "urls: $(wc -l < "$URLS" | tr -d ' ') URL(s) (engine: ${ENGINE[urls]:-none})"
+}
+
+# =============================================================================
+# Phase 10 — JS endpoints + secrets (reconFTW jschecks)
+# =============================================================================
+phase_js() {
+  [ -s "$WEB" ] || return
+  log "js: extracting endpoints/secrets from JavaScript"
+  local jslist="$OUT/.jsfiles"; : > "$jslist"
+  grep -iE '\.js(\?|$)' "$URLS" 2>/dev/null | sort -u > "$jslist"
+  if [ ! -s "$jslist" ]; then
+    while IFS= read -r u; do
+      curl -s -m 10 "$u" 2>/dev/null | grep -oE 'src="[^"]+\.js"' | sed -E 's/src="//; s/"$//' \
+        | sed -E "s#^/#${u%/}/#" >> "$jslist"
+    done < "$WEB"
+    sort -u "$jslist" -o "$jslist"
+  fi
+  local secret_re='(api[_-]?key|secret|token|authorization|aws_access_key_id|bearer|password|x-api-key|client_secret|firebase|s3\.amazonaws)'
+  while IFS= read -r js; do
+    [ -n "$js" ] || continue
+    curl -s -m 10 "$js" 2>/dev/null \
+      | grep -aoiE "${secret_re}[\"'[:space:]:=]+[^\"' ]{6,}" | head -20 \
+      | sed "s#^#[secret] ${js}: #" >> "$SECRETS"
+  done < "$jslist"
+  ENGINE[js]="curl-grep"
+  if have nuclei; then
+    nuclei -silent -nc -tags exposure,token -l "$WEB" 2>/dev/null | sed 's/^/[nuclei] /' >> "$SECRETS"
+    ENGINE[js]="curl-grep+nuclei"
+  fi
+  sort -u "$SECRETS" -o "$SECRETS"
+  ok "js: $(wc -l < "$SECRETS" | tr -d ' ') hit(s) from $(wc -l < "$jslist" | tr -d ' ') JS file(s)"
+}
+
+# =============================================================================
+# Phase 11 — Screenshots (Sn1per / Osmedeus / reconFTW)
+# =============================================================================
+phase_screens() {
+  [ -s "$WEB" ] || return
+  log "screenshots: capturing web endpoints"
+  mkdir -p "$SCREENS"
+  if have gowitness; then
+    gowitness scan file -f "$WEB" --screenshot-path "$SCREENS" >/dev/null 2>&1 && ENGINE[screens]="gowitness"
+  elif have httpx; then
+    httpx -silent -screenshot -srd "$SCREENS" -l "$WEB" >/dev/null 2>&1 && ENGINE[screens]="httpx"
+  else
+    warn "screenshots: no gowitness/httpx — skipping"; ENGINE[screens]="none"
+  fi
+  local n; n=$(find "$SCREENS" -type f 2>/dev/null | wc -l | tr -d ' ')
+  ok "screenshots: $n captured (engine: ${ENGINE[screens]:-none})"
+}
+
+# =============================================================================
+# Orchestration by mode (Sn1per-style)
+# =============================================================================
+[ "$RUN_VULNS" = "auto" ] && { case "$MODE" in full|vuln) RUN_VULNS=on ;; *) RUN_VULNS=off ;; esac; }
+
+case "$MODE" in
+  flyover)
+    phase_subs; phase_dns; phase_web; phase_waf ;;
+  recon)
+    phase_subs; phase_dns; phase_ports; phase_web; phase_waf
+    phase_content; phase_takeover; phase_urls ;;
+  full)
+    phase_subs; phase_dns; phase_ports; phase_web; phase_waf
+    phase_content; phase_takeover; phase_urls; phase_js; phase_screens ;;
+  vuln)
+    phase_subs; phase_dns; phase_web; phase_takeover ;;
+esac
+[ "$RUN_VULNS" = on ] && phase_vulns
+
+# =============================================================================
+# Aggregate — Osmedeus-style structured artifacts + concise stdout summary
+# =============================================================================
+n_subs=$(wc -l < "$SUBS" | tr -d ' ')
+n_hosts=$(wc -l < "$HOSTS" | tr -d ' ')
+n_ports=$(wc -l < "$PORTS" | tr -d ' ')
+n_web=$(wc -l < "$WEB" | tr -d ' ')
+n_content=$(wc -l < "$CONTENT" | tr -d ' ')
+n_vulns=$(wc -l < "$VULNS" | tr -d ' ')
+n_waf=$(wc -l < "$WAF" | tr -d ' ')
+n_takeover=$(wc -l < "$TAKEOVER" | tr -d ' ')
+n_urls=$(wc -l < "$URLS" | tr -d ' ')
+n_secrets=$(wc -l < "$SECRETS" | tr -d ' ')
+n_screens=$(find "$SCREENS" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+{
+  echo "# reconx report — $HOST"
+  echo
+  echo "- **Target:** \`$RAW_TARGET\` (host: \`$HOST\`, ip: $([ "$IS_IP" = 1 ] && echo yes || echo no))"
+  echo "- **Mode:** $MODE"
+  echo "- **Timestamp:** $TS"
+  echo "- **Engines:** subs=${ENGINE[subs]:-skip} dns=${ENGINE[dns]:-skip} ports=${ENGINE[ports]:-skip} web=${ENGINE[web]:-skip} waf=${ENGINE[waf]:-skip} content=${ENGINE[content]:-skip} takeover=${ENGINE[takeover]:-skip} urls=${ENGINE[urls]:-skip} js=${ENGINE[js]:-skip} screens=${ENGINE[screens]:-skip} vulns=${ENGINE[vulns]:-skip}"
+  echo
+  echo "## Counts"
+  echo "| Phase | Count | Artifact |"
+  echo "|-------|-------|----------|"
+  echo "| Subdomains | $n_subs | subdomains.txt |"
+  echo "| Live hosts | $n_hosts | hosts.txt |"
+  echo "| Open ports | $n_ports | ports.txt |"
+  echo "| Web endpoints | $n_web | web.txt |"
+  echo "| WAF/CDN signals | $n_waf | waf.txt |"
+  echo "| Content paths | $n_content | content.txt |"
+  echo "| Takeover candidates | $n_takeover | takeover.txt |"
+  echo "| Historical URLs | $n_urls | urls.txt |"
+  echo "| JS secrets/endpoints | $n_secrets | secrets.txt |"
+  echo "| Screenshots | $n_screens | screenshots/ |"
+  echo "| Vulnerabilities | $n_vulns | vulns.txt |"
+  echo
+  if [ "$n_takeover" -gt 0 ]; then
+    echo "## Subdomain takeover candidates"; echo '```'; head -n 20 "$TAKEOVER"; echo '```'
+  fi
+  if [ "$n_secrets" -gt 0 ]; then
+    echo "## JS secrets / endpoints (sample)"; echo '```'; head -n 20 "$SECRETS"; echo '```'
+  fi
+  if [ "$n_vulns" -gt 0 ]; then
+    echo "## Top vulnerability findings"; echo '```'; head -n 20 "$VULNS"; echo '```'
+  fi
+  if [ "$n_web" -gt 0 ]; then
+    echo "## Web endpoints (sample)"; echo '```'; head -n 20 "$WEB"; echo '```'
+  fi
+  if [ "$n_content" -gt 0 ]; then
+    echo "## Interesting paths (sample)"; echo '```'; head -n 20 "$CONTENT"; echo '```'
+  fi
+} > "$SUMMARY"
+
+# Machine-readable result (Osmedeus-like). jq if present, else hand-rolled.
+if have jq; then
+  jq -n \
+    --arg target "$RAW_TARGET" --arg host "$HOST" --arg mode "$MODE" --arg ts "$TS" --arg out "$OUT" \
+    --argjson subs "$n_subs" --argjson hosts "$n_hosts" --argjson ports "$n_ports" \
+    --argjson web "$n_web" --argjson waf "$n_waf" --argjson content "$n_content" \
+    --argjson takeover "$n_takeover" --argjson urls "$n_urls" --argjson secrets "$n_secrets" \
+    --argjson screens "$n_screens" --argjson vulns "$n_vulns" \
+    '{target:$target, host:$host, mode:$mode, timestamp:$ts, output_dir:$out,
+      counts:{subdomains:$subs, hosts:$hosts, ports:$ports, web:$web, waf:$waf,
+              content:$content, takeover:$takeover, urls:$urls, secrets:$secrets,
+              screenshots:$screens, vulns:$vulns}}' \
+    > "$RESULT"
+else
+  printf '{"target":"%s","host":"%s","mode":"%s","timestamp":"%s","output_dir":"%s","counts":{"subdomains":%s,"hosts":%s,"ports":%s,"web":%s,"waf":%s,"content":%s,"takeover":%s,"urls":%s,"secrets":%s,"screenshots":%s,"vulns":%s}}\n' \
+    "$RAW_TARGET" "$HOST" "$MODE" "$TS" "$OUT" "$n_subs" "$n_hosts" "$n_ports" "$n_web" "$n_waf" "$n_content" "$n_takeover" "$n_urls" "$n_secrets" "$n_screens" "$n_vulns" > "$RESULT"
+fi
+
+# ---- concise stdout summary (LLM-friendly; full data is on disk) ----------
+echo "===== RECONX SUMMARY ($HOST / $MODE) ====="
+echo "subdomains=$n_subs live_hosts=$n_hosts open_ports=$n_ports web=$n_web waf=$n_waf content=$n_content takeover=$n_takeover urls=$n_urls js_secrets=$n_secrets screenshots=$n_screens vulns=$n_vulns"
+echo "artifacts: $OUT  (summary.md, result.json + per-phase .txt)"
+if [ "$n_takeover" -gt 0 ]; then echo "--- takeover candidates ---"; head -n 10 "$TAKEOVER"; fi
+if [ "$n_vulns" -gt 0 ]; then echo "--- top vulns ---"; head -n 10 "$VULNS"; fi
+if [ "$n_secrets" -gt 0 ]; then echo "--- js secrets/endpoints ---"; head -n 10 "$SECRETS"; fi
+if [ "$n_web" -gt 0 ]; then echo "--- web (sample) ---"; head -n 10 "$WEB"; fi
+if [ "$n_content" -gt 0 ]; then echo "--- paths (sample) ---"; head -n 10 "$CONTENT"; fi
+echo "===== END RECONX SUMMARY ====="
+
+[ "$n_hosts" -gt 0 ] || { warn "no reachable hosts resolved"; exit 3; }
+exit 0

@@ -1,0 +1,65 @@
+services:
+  pentestgpt:
+    container_name: pentestgpt
+    image: pentestgpt:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount workspace for file operations
+      - ./workspace:/workspace
+      # Persist Claude Code configuration across container restarts
+      - claude-config:/home/pentester/.claude
+      # Persist CCR configuration
+      - ccr-config:/home/pentester/.claude-code-router
+    stdin_open: true
+    tty: true
+    # Required for OpenVPN (HackTheBox/TryHackMe connectivity)
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # Use host network for easy access to benchmark containers
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Resource allocation - adjust based on your system
+    # More CPUs and memory improve performance for complex tasks
+    deploy:
+      resources:
+        limits:
+          cpus: '4'        # Max 4 CPU cores (adjust higher if available)
+          memory: 8G       # Max 8GB RAM
+        reservations:
+          cpus: '2'        # Guarantee 2 CPU cores
+          memory: 4G       # Guarantee 4GB RAM
+    environment:
+      # Terminal settings
+      - TERM=xterm-256color
+      # Python settings
+      - PYTHONUNBUFFERED=1
+      # Agent brain: "cloudflare" (GLM 5.2, default) or "claude"
+      - LLM_BACKEND=${LLM_BACKEND:-cloudflare}
+      # Cloudflare Workers AI (GLM 5.2) — the default brain
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CLOUDFLARE_MODEL=${CLOUDFLARE_MODEL:-@cf/zai-org/glm-5.2}
+      - CLOUDFLARE_FALLBACK_MODEL=${CLOUDFLARE_FALLBACK_MODEL:-@cf/zai-org/glm-4.7-flash}
+      - CF_MAX_RETRIES=${CF_MAX_RETRIES:-3}
+      # Free-tier budget guardrails
+      - CF_MAX_TOKENS_PER_SCAN=${CF_MAX_TOKENS_PER_SCAN:-6000}
+      - CF_MAX_SCANS_PER_DAY=${CF_MAX_SCANS_PER_DAY:-4}
+      - CF_DAILY_TOKEN_BUDGET=${CF_DAILY_TOKEN_BUDGET:-10000}
+      - CF_TOOL_TIMEOUT=${CF_TOOL_TIMEOUT:-300}
+      - CF_MAX_STEPS=${CF_MAX_STEPS:-5}
+      - CF_ENFORCE_DAILY_LIMIT=${CF_ENFORCE_DAILY_LIMIT:-false}
+      # Auth mode (only relevant for --backend claude): "openrouter", "anthropic", or "manual"
+      - PENTESTGPT_AUTH_MODE=${PENTESTGPT_AUTH_MODE:-manual}
+      # API keys (set based on auth mode via .env.auth)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+
+volumes:
+  # Named volume for Claude Code config persistence
+  claude-config:
+  # Named volume for CCR config persistence
+  ccr-config:
